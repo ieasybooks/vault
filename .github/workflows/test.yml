@@ -115,11 +115,20 @@ jobs:
           [ "$(wc -w <<< "$jobs")" -eq 2 ] || { echo "::error::Expected two vault jobs, found: $jobs"; exit 1; }
           printf '%s\n' "$TEST_SECRET" | grep -v '^$' > "$RUNNER_TEMP/lines"
           for job in $jobs; do
-            # A finished job's log can take a few seconds to be ready.
+            # A finished job's log can take a few seconds to be ready. Not gh
+            # api: it won't output logs, which hold terminal color codes.
+            rm -f "$RUNNER_TEMP/log"
             for _ in 1 2 3 4 5 6; do
-              if gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$job/logs" > "$RUNNER_TEMP/log"; then break; fi
+              if curl -fsSL -H @<(printf 'Authorization: Bearer %s\n' "$GH_TOKEN") -o "$RUNNER_TEMP/log" \
+                "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/jobs/$job/logs"; then
+                break
+              fi
               sleep 10
             done
+            if [ ! -s "$RUNNER_TEMP/log" ]; then
+              echo "::error::Couldn't download job $job's log."
+              exit 1
+            fi
             if ! grep -q 'masked: \*\*\*' "$RUNNER_TEMP/log"; then
               echo "::error::Job $job's log doesn't show TEST_SECRET as ***."
               exit 1
