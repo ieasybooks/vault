@@ -1,0 +1,141 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - run: node --test test/*.test.js
+
+  # The action against the real vault, which shares TEST_SECRET with this
+  # workflow in this repository only.
+  vault:
+    name: vault (${{ matrix.os }})
+    # Runs for pull requests from forks get no OIDC token.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch TEST_SECRET every way
+        uses: ./
+        with:
+          secrets: |
+            TEST_SECRET
+            TEST_SECRET=RENAMED
+          files: TEST_SECRET.txt
+          base64-files: TEST_SECRET.bin=DECODED_FILE
+
+      - name: Check what arrived
+        env:
+          EXPECTED_SHA256: ${{ vars.TEST_SECRET_SHA256 }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          sha() { shasum -a 256 | cut -d' ' -f1; }
+          mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+          [ -n "$EXPECTED_SHA256" ] || fail "Set the repository variable TEST_SECRET_SHA256; see README.md."
+          [ "$(printf %s "$TEST_SECRET" | wc -l)" -ge 1 ] || fail "TEST_SECRET should be more than one line."
+          [ "$(printf %s "$TEST_SECRET" | sha)" = "$EXPECTED_SHA256" ] || fail "\$TEST_SECRET doesn't match TEST_SECRET_SHA256."
+          [ "$RENAMED" = "$TEST_SECRET" ] || fail "\$RENAMED isn't \$TEST_SECRET."
+          case $TEST_SECRET_FILE in "$RUNNER_TEMP"/vault-*/TEST_SECRET.txt) ;; *) fail "\$TEST_SECRET_FILE is $TEST_SECRET_FILE." ;; esac
+          case $DECODED_FILE in "$RUNNER_TEMP"/vault-*/TEST_SECRET.bin) ;; *) fail "\$DECODED_FILE is $DECODED_FILE." ;; esac
+          [ "$(sha < "$TEST_SECRET_FILE")" = "$EXPECTED_SHA256" ] || fail "\$TEST_SECRET_FILE doesn't match TEST_SECRET_SHA256."
+          [ "$(printf %s "$TEST_SECRET" | tr -d '\n' | base64 --decode | sha)" = "$(sha < "$DECODED_FILE")" ] ||
+            fail "\$DECODED_FILE isn't TEST_SECRET decoded."
+          [ "$(mode "$TEST_SECRET_FILE")" = 600 ] && [ "$(mode "$DECODED_FILE")" = 600 ] || fail "The files should be mode 600."
+          echo "TEST_SECRET arrived intact in each variable and file."
+
+      - name: Print TEST_SECRET, for the masking job to find as ***
+        run: |
+          echo "masked: $TEST_SECRET"
+
+      - name: Ask for TEST_SECRET and a secret that isn't in the vault
+        id: refused
+        continue-on-error: true
+        uses: ./
+        with:
+          secrets: |
+            TEST_SECRET=SHOULD_STAY_UNSET
+            NOT_IN_THE_VAULT
+
+      - name: Check that the vault refused both
+        env:
+          OUTCOME: ${{ steps.refused.outcome }}
+        run: |
+          test "$OUTCOME" = failure
+          test -z "${SHOULD_STAY_UNSET:-}"
+
+  masking:
+    name: Masking
+    needs: vault
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./
+        with:
+          secrets: TEST_SECRET
+      - name: Check that the vault jobs' logs show TEST_SECRET only as ***
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" \
+            --jq '.jobs[] | select(.name | startswith("vault (")) | .id')
+          [ "$(wc -w <<< "$jobs")" -eq 2 ] || { echo "::error::Expected two vault jobs, found: $jobs"; exit 1; }
+          printf '%s\n' "$TEST_SECRET" | grep -v '^$' > "$RUNNER_TEMP/lines"
+          for job in $jobs; do
+            # A finished job's log can take a few seconds to be ready. Not gh
+            # api: it won't output logs, which hold terminal color codes.
+            rm -f "$RUNNER_TEMP/log"
+            for _ in 1 2 3 4 5 6; do
+              if curl -fsSL -H @<(printf 'Authorization: Bearer %s\n' "$GH_TOKEN") -o "$RUNNER_TEMP/log" \
+                "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/jobs/$job/logs"; then
+                break
+              fi
+              sleep 10
+            done
+            if [ ! -s "$RUNNER_TEMP/log" ]; then
+              echo "::error::Couldn't download job $job's log."
+              exit 1
+            fi
+            if ! grep -q 'masked: \*\*\*' "$RUNNER_TEMP/log"; then
+              echo "::error::Job $job's log doesn't show TEST_SECRET as ***."
+              exit 1
+            fi
+            if grep -qF -f "$RUNNER_TEMP/lines" "$RUNNER_TEMP/log"; then
+              echo "::error::Job $job's log shows TEST_SECRET."
+              exit 1
+            fi
+          done
+          echo "The vault jobs' logs show TEST_SECRET only as ***."
