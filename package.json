@@ -1,0 +1,12 @@
+{
+  "name": "vault",
+  "private": true,
+  "description": "GitHub Action that fetches secrets from the ieasybooks vault",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}

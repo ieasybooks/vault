@@ -1,0 +1,31 @@
+name: ieasybooks vault
+description: Fetch secrets from the ieasybooks vault into the job's environment or into files.
+author: ieasybooks
+
+inputs:
+  secrets:
+    description: >-
+      Secrets to put in the environment of the job's later steps, one per line or comma-separated:
+      NAME, or NAME=VAR to use another variable name.
+    required: false
+    default: ""
+  files:
+    description: >-
+      Secrets to write to files as they're stored, such as JSON keys: NAME, or NAME.ext to give the file an
+      extension, either with =VAR to choose the variable that holds the file's path (NAME_FILE by default).
+    required: false
+    default: ""
+  base64-files:
+    description: >-
+      Like files, for secrets stored as base64, such as .p12 certificates and keystores: the file holds the
+      decoded bytes.
+    required: false
+    default: ""
+  url:
+    description: The vault's address. Only the tests change it.
+    required: false
+    default: https://vault.ieasybooks.com
+
+runs:
+  using: node24
+  main: src/main.js
