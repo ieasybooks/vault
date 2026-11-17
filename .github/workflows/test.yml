@@ -90,6 +90,38 @@ jobs:
           test "$OUTCOME" = failure
           test -z "${SHOULD_STAY_UNSET:-}"
 
+      # expect-refused passes only when no rule matches. On pull requests the
+      # vault refuses APPLE_API_KEY for another reason (it isn't shared with
+      # pull_request runs), which rightly proves nothing.
+      - name: Expect the vault to refuse a secret this workflow isn't given
+        if: github.event_name != 'pull_request'
+        uses: ./
+        with:
+          expect-refused: APPLE_API_KEY
+
+      - name: Expect a refusal of TEST_SECRET, which this workflow does get
+        id: served-anyway
+        continue-on-error: true
+        uses: ./
+        with:
+          expect-refused: TEST_SECRET
+
+      - name: Expect a refusal of a secret that isn't in the vault
+        id: not-in-the-vault
+        continue-on-error: true
+        uses: ./
+        with:
+          expect-refused: NOT_IN_THE_VAULT
+
+      - name: Check that both of those failed, and delivered nothing
+        env:
+          SERVED_ANYWAY: ${{ steps.served-anyway.outcome }}
+          NOT_IN_THE_VAULT: ${{ steps.not-in-the-vault.outcome }}
+        run: |
+          test "$SERVED_ANYWAY" = failure
+          test "$NOT_IN_THE_VAULT" = failure
+          test -z "${NOT_IN_THE_VAULT_FILE:-}"
+
   masking:
     name: Masking
     needs: vault

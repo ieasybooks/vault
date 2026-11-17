@@ -1,5 +1,5 @@
 name: ieasybooks vault
-description: Fetch secrets from the ieasybooks vault into the job's environment or into files.
+description: Fetch secrets from the ieasybooks vault into the job's environment or into files, or check that it refuses some.
 author: ieasybooks
 
 inputs:
@@ -19,6 +19,14 @@ inputs:
     description: >-
       Like files, for secrets stored as base64, such as .p12 certificates and keystores: the file holds the
       decoded bytes.
+    required: false
+    default: ""
+  expect-refused:
+    description: >-
+      Secrets the vault must refuse this job, one per line or comma-separated, such as another workflow's deploy
+      token. Each is asked for in its own request, before any secret is fetched, and must be refused because none of
+      its rules matches the job; any other answer fails the step, and a value served by mistake is masked and dropped.
+      Can be the only input.
     required: false
     default: ""
   url:

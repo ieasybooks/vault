@@ -121,6 +121,28 @@ test("a refusal fails the step with one error annotation", async () => {
   assert.deepEqual(r.variables, {});
 });
 
+test("expect-refused alone, end to end", async () => {
+  const why = "no rule matches workflow_dispatch on refs/heads/main by AliOsm, running x";
+  const r = await runMain({ "expect-refused": "A, B" }, [
+    { status: 403, body: { error: "refused", refused: { A: why } } },
+    { status: 403, body: { error: "refused", refused: { B: why } } },
+  ]);
+  assert.equal(r.code, 0, r.stdout);
+  assert.deepEqual(
+    r.requests.filter((request) => request.url === "/ci").map((request) => JSON.parse(request.body)),
+    [{ secrets: ["A"] }, { secrets: ["B"] }],
+  );
+  assert.deepEqual(r.variables, {});
+});
+
+test("a secret served against expect-refused fails the step without printing it", async () => {
+  const r = await runMain({ secrets: "C", "expect-refused": "A" }, [{ status: 200, body: { secrets: { A: "must-never-print" } } }]);
+  assert.equal(r.code, 1);
+  assert.match(r.stdout, /^::error::The vault served A, which this job must not get/m);
+  for (const line of logLines(r.stdout)) assert.ok(!line.includes("must-never-print"));
+  assert.deepEqual(r.variables, {});
+});
+
 test("no id-token permission", async () => {
   const r = await runMain({ secrets: "A" }, [], { ACTIONS_ID_TOKEN_REQUEST_URL: "", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "" });
   assert.equal(r.code, 1);

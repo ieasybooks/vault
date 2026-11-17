@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, test } from "node:test";
 
-import { ActionError, envFileEntries, escapeData, maskedParts, parseInputs, run, vaultUrl } from "../src/vault.js";
+import { ActionError, envFileEntries, escapeData, maskedParts, parseExpectRefused, parseInputs, run, vaultUrl } from "../src/vault.js";
 import { logLines, masksIn, parseEnvFile, unescapeData } from "./helpers.js";
 
 const TOKEN_URL = "https://token.example/_apis/idtoken?api-version=2.0";
@@ -153,6 +153,35 @@ describe("parseInputs", () => {
   }
 });
 
+describe("parseExpectRefused", () => {
+  const parse = (inputs) => {
+    const env = Object.fromEntries(Object.entries(inputs).map(([key, value]) => [`INPUT_${key.toUpperCase()}`, value]));
+    return parseExpectRefused(env, parseInputs(env));
+  };
+
+  test("names by line or comma, with comments", () => {
+    assert.deepEqual(parse({ "expect-refused": "# what the web job must not get\nAPPLE_API_KEY, B\n\nC" }), ["APPLE_API_KEY", "B", "C"]);
+  });
+
+  test("works alone, without secrets to fetch", () => {
+    assert.deepEqual(parse({ "expect-refused": "A" }), ["A"]);
+  });
+
+  for (const [inputs, pattern] of [
+    [{ "expect-refused": "lower" }, /expect-refused: "lower" isn't a secret name/],
+    [{ "expect-refused": "A=VAR" }, /expect-refused: "A=VAR" isn't a secret name/],
+    [{ "expect-refused": "A.json" }, /isn't a secret name/],
+    [{ "expect-refused": "A, B, A" }, /expect-refused lists A twice/],
+    [{ secrets: "A", "expect-refused": "A" }, /A is both fetched and expected to be refused/],
+    [{ files: "A.json", "expect-refused": "B, A" }, /A is both fetched and expected to be refused/],
+    [{ "expect-refused": " # only a comment" }, /List the secrets to fetch .* or those the vault must refuse in expect-refused/],
+  ]) {
+    test(`refuses ${JSON.stringify(inputs)}`, () => {
+      assert.throws(() => parse(inputs), (error) => error instanceof ActionError && pattern.test(error.message));
+    });
+  }
+});
+
 describe("vaultUrl", () => {
   test("defaults to the vault", () => {
     for (const input of [undefined, "", "  "]) assert.equal(vaultUrl(input), "https://vault.ieasybooks.com");
@@ -231,6 +260,105 @@ describe("envFileEntries", () => {
     assert.deepEqual(parseEnvFile(text), variables);
     const delimiters = text.split("\n").filter((line) => /^[A-D]<<ghadelimiter_/.test(line)).map((line) => line.split("<<")[1]);
     assert.equal(new Set(delimiters).size, 4, "a new delimiter per variable");
+  });
+});
+
+describe("expect-refused", () => {
+  const NO_RULE = "no rule matches workflow_dispatch on refs/heads/main by AliOsm, running ieasybooks/mofied/.github/workflows/release-please.yml@refs/heads/main";
+  const refusedFor = (name, why = NO_RULE) => reply(403, { error: "refused", refused: { [name]: why } });
+
+  test("passes when the vault refuses the secret because no rule matches, without GITHUB_ENV", async () => {
+    const r = await act({ "expect-refused": "WEB_TOKEN" }, { vault: [refusedFor("WEB_TOKEN")], env: { GITHUB_ENV: "", RUNNER_TEMP: "" } });
+    assert.equal(r.error, undefined, r.error?.stack);
+    assert.equal(r.vaultCalls.length, 1);
+    assert.deepEqual(JSON.parse(r.vaultCalls[0].init.body), { secrets: ["WEB_TOKEN"] });
+    assert.equal(r.vaultCalls[0].init.headers.authorization, `Bearer ${ID_TOKEN}`);
+    assert.deepEqual(logLines(r.stdout), [`The vault refuses WEB_TOKEN to this job, as it should: ${NO_RULE}`]);
+  });
+
+  test("asks for each name in its own request", async () => {
+    const r = await act({ "expect-refused": "A, B, C" }, { vault: [refusedFor("A"), refusedFor("B"), refusedFor("C")] });
+    assert.equal(r.error, undefined, r.error?.stack);
+    assert.deepEqual(
+      r.vaultCalls.map((call) => JSON.parse(call.init.body)),
+      [{ secrets: ["A"] }, { secrets: ["B"] }, { secrets: ["C"] }],
+    );
+  });
+
+  test("checks the refusals before fetching, then fetches as usual", async () => {
+    const r = await act({ secrets: "STORE_SECRET", "expect-refused": "WEB_TOKEN" }, { vault: [refusedFor("WEB_TOKEN"), served({ STORE_SECRET: "store-secret-value" })] });
+    assert.equal(r.error, undefined, r.error?.stack);
+    assert.deepEqual(
+      r.vaultCalls.map((call) => JSON.parse(call.init.body)),
+      [{ secrets: ["WEB_TOKEN"] }, { secrets: ["STORE_SECRET"] }],
+    );
+    assert.equal(r.variables.STORE_SECRET, "store-secret-value");
+  });
+
+  test("a secret served by mistake fails before anything is delivered, masked and never printed or written", async () => {
+    const r = await act(
+      { secrets: "STORE_SECRET", "expect-refused": "WEB_TOKEN" },
+      { vault: [served({ WEB_TOKEN: "leaked-token-value" }), served({ STORE_SECRET: "store-secret-value" })] },
+    );
+    assertActionError(r, /^The vault served WEB_TOKEN, which this job must not get: no rule should match it\.$/);
+    assert.ok(!r.error.message.includes("leaked-token-value"));
+    assert.equal(r.vaultCalls.length, 1, "the secrets aren't fetched");
+    assert.deepEqual(r.variables, { EARLIER: "kept" });
+    assert.ok(masksIn(r.stdout).includes("leaked-token-value"));
+    for (const line of logLines(r.stdout)) assert.ok(!line.includes("leaked-token-value"));
+  });
+
+  test("a served answer without the value still fails", async () => {
+    const r = await act({ "expect-refused": "A" }, { vault: [reply(200, { secrets: {} })] });
+    assertActionError(r, /^The vault served A, which this job must not get/);
+  });
+
+  test("other refusals prove nothing, and aren't waited out", async () => {
+    for (const why of ["isn't in the vault", "has no value yet: mise run vault:set A", "isn't shared with pull_request runs"]) {
+      const r = await act({ "expect-refused": "A" }, { vault: [refusedFor("A", why), refusedFor("A")] });
+      assertActionError(r, new RegExp(`^The vault didn't refuse A because no rule matches, so this proves nothing: HTTP 403, ${why.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.$`));
+      assert.deepEqual(r.sleeps, []);
+      assert.equal(r.vaultCalls.length, 1);
+    }
+  });
+
+  test("a refusal of another secret doesn't count", async () => {
+    const r = await act({ "expect-refused": "A" }, { vault: [refusedFor("B")] });
+    assertActionError(r, /^The vault didn't refuse A because no rule matches, so this proves nothing: HTTP 403, refused\.$/);
+  });
+
+  test("token, server and other answers prove nothing", async () => {
+    const cases = [
+      [reply(401, { error: "token expired" }), /HTTP 401, token expired\.$/],
+      [reply(403, { error: "only GitHub-hosted runners can use the vault" }), /HTTP 403, only GitHub-hosted runners can use the vault\.$/],
+      [reply(500, "Internal Server Error"), /HTTP 500\.$/],
+      [reply(404, { error: "not found" }), /HTTP 404, not found\.$/],
+    ];
+    for (const [answer, pattern] of cases) {
+      const r = await act({ "expect-refused": "A" }, { vault: [answer] });
+      assertActionError(r, pattern);
+      assert.match(r.error.message, /^The vault didn't refuse A because no rule matches, so this proves nothing/);
+    }
+  });
+
+  test("retries the vault's 502 and 503 and network failures, as a fetch does", async () => {
+    const r = await act(
+      { "expect-refused": "A" },
+      { vault: [reply(503, { error: "keys loading" }, { "retry-after": "2" }), new TypeError("fetch failed"), refusedFor("A")] },
+    );
+    assert.equal(r.error, undefined, r.error?.stack);
+    assert.deepEqual(r.sleeps, [2000, 5000]);
+  });
+
+  test("gives up on a vault it can't reach", async () => {
+    const r = await act({ "expect-refused": "A" }, { vault: Array.from({ length: 4 }, () => new TypeError("fetch failed")) });
+    assertActionError(r, /^Couldn't reach the vault at https:\/\/vault\.ieasybooks\.com: fetch failed\.$/);
+  });
+
+  test("stops at the first name that fails", async () => {
+    const r = await act({ "expect-refused": "A, B" }, { vault: [refusedFor("A", "isn't in the vault"), refusedFor("B")] });
+    assertActionError(r, /didn't refuse A/);
+    assert.equal(r.vaultCalls.length, 1);
   });
 });
 
