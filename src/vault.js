@@ -1,7 +1,8 @@
 // Fetches secrets from the ieasybooks vault into a GitHub Actions job: the job
 // proves who it is with its GitHub OIDC token, the vault checks that against
 // each secret's rules, and the values go into the environment of the job's
-// later steps or into files. See README.md.
+// later steps or into files. It can also check that the vault refuses the job
+// secrets it must not have (expect-refused). See README.md.
 //
 // No dependencies, so it runs straight from the repository on the runner's Node.
 
@@ -26,6 +27,7 @@ const NETWORK_RETRY_EVERY_MS = 5_000;
 // this aren't masked: lines like "}" would hide every brace in the logs.
 const MIN_MASKED_PART = 8;
 
+const SECRET_NAME = /^[A-Z][A-Z0-9_]*$/;
 const SECRET_ENTRY = /^([A-Z][A-Z0-9_]*)(?:=([A-Za-z_][A-Za-z0-9_]*))?$/;
 const FILE_ENTRY = /^([A-Z][A-Z0-9_]*)((?:\.[A-Za-z0-9_-]+)*)(?:=([A-Za-z_][A-Za-z0-9_]*))?$/;
 // Variables the runner or later steps rely on.
@@ -42,9 +44,10 @@ export async function run({
   stdout = process.stdout,
 } = {}) {
   const deliveries = parseInputs(env);
+  const refusals = parseExpectRefused(env, deliveries);
   const url = vaultUrl(env.INPUT_URL);
   const githubEnv = env.GITHUB_ENV;
-  if (!githubEnv) throw new ActionError("GITHUB_ENV isn't set: run this action in a GitHub Actions job.");
+  if (!githubEnv && deliveries.length > 0) throw new ActionError("GITHUB_ENV isn't set: run this action in a GitHub Actions job.");
   const runnerTemp = env.RUNNER_TEMP;
   if (!runnerTemp && deliveries.some((d) => d.file)) {
     throw new ActionError("RUNNER_TEMP isn't set: files need a GitHub Actions runner.");
@@ -55,6 +58,10 @@ export async function run({
 
   const token = await idToken(env, url, io);
   mask(token);
+  // First, so nothing is delivered when the vault serves one by mistake.
+  for (const name of refusals) await expectRefusal(url, token, name, io, mask);
+  if (deliveries.length === 0) return;
+
   const names = [...new Set(deliveries.map((d) => d.name))];
   const values = await askVault(url, token, names, io);
   // Before anything else can print them.
@@ -94,8 +101,8 @@ export function parseInputs(env) {
       deliveries.push(file ? fileEntry(input, entry, decode) : secretEntry(entry));
     }
   }
-  if (deliveries.length === 0) {
-    throw new ActionError("List the secrets to fetch in secrets, files or base64-files.");
+  if (deliveries.length === 0 && entries(env["INPUT_EXPECT-REFUSED"]).length === 0) {
+    throw new ActionError("List the secrets to fetch in secrets, files or base64-files, or those the vault must refuse in expect-refused.");
   }
 
   const variables = new Set();
@@ -114,6 +121,21 @@ export function parseInputs(env) {
     }
   }
   return deliveries;
+}
+
+// The expect-refused input: names the vault must refuse this job, one per line
+// or comma-separated. A name can't also be fetched.
+export function parseExpectRefused(env, deliveries = []) {
+  const names = [];
+  for (const entry of entries(env["INPUT_EXPECT-REFUSED"])) {
+    if (!SECRET_NAME.test(entry)) throw new ActionError(`expect-refused: "${entry}" isn't a secret name like APPLE_API_KEY.`);
+    if (names.includes(entry)) throw new ActionError(`expect-refused lists ${entry} twice.`);
+    if (deliveries.some((d) => d.name === entry)) {
+      throw new ActionError(`${entry} is both fetched and expected to be refused; list it in one place.`);
+    }
+    names.push(entry);
+  }
+  return names;
 }
 
 // Lines starting with # are comments.
@@ -207,10 +229,11 @@ async function idToken(env, audience, { fetch, sleep, log }) {
   }
 }
 
-// POST /ci answers with every secret asked for, or refuses them all.
-async function askVault(url, token, names, { fetch, sleep, now, log }) {
-  const started = now();
-  let networkFailures = 0;
+// POST /ci, retrying network failures and the vault's 502 and 503 answers
+// within two minutes of `retry.started`. Any other answer is returned as
+// { status, body }; a 200's body holds the values, so it never goes into a
+// message.
+async function postCi(url, token, names, { fetch, sleep, now, log }, retry) {
   for (;;) {
     let response;
     let body;
@@ -221,36 +244,44 @@ async function askVault(url, token, names, { fetch, sleep, now, log }) {
         body: JSON.stringify({ secrets: names }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-      // Never in an error message: a 200's body holds the values.
       body = parseJson(await response.text());
     } catch (error) {
-      networkFailures++;
+      retry.networkFailures++;
       const problem = reason(error);
-      if (networkFailures > NETWORK_RETRIES || now() - started + NETWORK_RETRY_EVERY_MS > RETRY_FOR_MS) {
+      if (retry.networkFailures > NETWORK_RETRIES || now() - retry.started + NETWORK_RETRY_EVERY_MS > RETRY_FOR_MS) {
         throw new ActionError(`Couldn't reach the vault at ${url}: ${problem}.`);
       }
       log(`Couldn't reach the vault (${problem}); retrying in ${NETWORK_RETRY_EVERY_MS / 1000}s.`);
       await sleep(NETWORK_RETRY_EVERY_MS);
       continue;
     }
-    if (response.status === 200) return servedValues(body, names);
-    const detail = typeof body?.error === "string" ? body.error : null;
-    const error = detail ?? `HTTP ${response.status}`;
-
     if (response.status === 502 || response.status === 503) {
+      const error = (typeof body?.error === "string" ? body.error : null) ?? `HTTP ${response.status}`;
       const wait = retryAfterSeconds(response.headers.get("retry-after"));
-      if (now() - started + wait * 1000 > RETRY_FOR_MS) {
+      if (now() - retry.started + wait * 1000 > RETRY_FOR_MS) {
         throw new ActionError(`The vault still can't answer after trying for ${RETRY_FOR_MS / 1000}s: ${error}.`);
       }
       log(`The vault asks to retry in ${wait}s: ${error}.`);
       await sleep(wait * 1000);
       continue;
     }
+    return { status: response.status, body };
+  }
+}
 
-    if (response.status === 403 && isObject(body?.refused) && Object.keys(body.refused).length > 0) {
+// POST /ci answers with every secret asked for, or refuses them all.
+async function askVault(url, token, names, io) {
+  const { sleep, now, log } = io;
+  const retry = { started: now(), networkFailures: 0 };
+  for (;;) {
+    const { status, body } = await postCi(url, token, names, io, retry);
+    if (status === 200) return servedValues(body, names);
+    const detail = typeof body?.error === "string" ? body.error : null;
+
+    if (status === 403 && isObject(body?.refused) && Object.keys(body.refused).length > 0) {
       const refused = Object.entries(body.refused).map(([name, why]) => [name, String(why)]);
       const settling = refused.every(([, why]) => why.startsWith("has no value yet"));
-      if (settling && now() - started + NO_VALUE_RETRY_EVERY_MS <= NO_VALUE_RETRY_FOR_MS) {
+      if (settling && now() - retry.started + NO_VALUE_RETRY_EVERY_MS <= NO_VALUE_RETRY_FOR_MS) {
         log(
           `The vault has no value yet for ${refused.map(([name]) => name).join(", ")}. ` +
             `A value set seconds ago takes a moment to reach it; retrying in ${NO_VALUE_RETRY_EVERY_MS / 1000}s.`,
@@ -261,8 +292,30 @@ async function askVault(url, token, names, { fetch, sleep, now, log }) {
       throw new ActionError(["The vault refused this job:", ...refused.map(([name, why]) => `  ${name}: ${why}`)].join("\n"));
     }
 
-    throw new ActionError(`The vault answered HTTP ${response.status}${detail ? `: ${detail}` : ""}.`);
+    throw new ActionError(`The vault answered HTTP ${status}${detail ? `: ${detail}` : ""}.`);
   }
+}
+
+// Asks for one secret alone, which the vault must refuse because none of its
+// rules matches this job. Any other answer proves nothing and fails: a secret
+// that isn't in the vault, or has no value yet, or a token or server problem.
+// A value served by mistake is masked and dropped, never written or printed.
+async function expectRefusal(url, token, name, io, mask) {
+  const { status, body } = await postCi(url, token, [name], io, { started: io.now(), networkFailures: 0 });
+  if (status === 200) {
+    const value = isObject(body?.secrets) ? body.secrets[name] : undefined;
+    if (typeof value === "string" && value !== "") for (const part of maskedParts(value)) mask(part);
+    throw new ActionError(`The vault served ${name}, which this job must not get: no rule should match it.`);
+  }
+  const why = status === 403 && isObject(body?.refused) ? body.refused[name] : undefined;
+  if (typeof why === "string" && why.startsWith("no rule matches ")) {
+    io.log(`The vault refuses ${name} to this job, as it should: ${why}`);
+    return;
+  }
+  const detail = typeof why === "string" ? why : typeof body?.error === "string" ? body.error : null;
+  throw new ActionError(
+    `The vault didn't refuse ${name} because no rule matches, so this proves nothing: HTTP ${status}${detail ? `, ${detail}` : ""}.`,
+  );
 }
 
 function servedValues(body, names) {

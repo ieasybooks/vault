@@ -34,6 +34,21 @@ Put entries one per line or separate them with commas; lines starting with `#` a
 
 The vault serves every secret a step asks for, or none. If it refuses one, the step fails without setting anything, and the error says why for each refused secret.
 
+### Checking that the vault refuses a secret
+
+`expect-refused` lists secrets the vault must keep from the job, such as another workflow's deploy token, to check its rules from the job itself:
+
+```yaml
+      - uses: ieasybooks/vault@<commit SHA> # v1
+        with:
+          expect-refused: MOFIED_WEB_DEPLOY_TOKEN
+```
+
+- Each name is asked for in its own request, before any secret is fetched.
+- Each must be refused because none of its rules matches the job, so the step proves that the rules keep the secret from it.
+- Any other answer fails the step, because it proves nothing: the secret isn't in the vault, has no value yet, or isn't shared with this event; the token or the vault had a problem; or the vault served it. A value served by mistake is masked and dropped, never written or printed.
+- It can be the only input, or come with the others.
+
 ## What it does
 
 1. It asks GitHub for the job's OIDC token, with `https://vault.ieasybooks.com` as its audience, and masks the token.
@@ -66,7 +81,8 @@ The Test workflow also runs the action against the real vault on pushes to `main
 1. checks the value against the repository variable `TEST_SECRET_SHA256`;
 2. checks every file it wrote;
 3. checks that asking for a secret that isn't in the vault fails;
-4. reads the jobs' logs to check that the value shows only as `***`.
+4. checks `expect-refused`: that the vault refuses this workflow `APPLE_API_KEY` because no rule matches, except on pull requests, where it refuses it for another reason; and that expecting a refusal of `TEST_SECRET`, which it does get, or of a secret that isn't in the vault, fails;
+5. reads the jobs' logs to check that the value shows only as `***`.
 
 To replace `TEST_SECRET`, from a checkout of ieasybooks/infrastructure:
 
